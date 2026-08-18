@@ -1,0 +1,57 @@
+# Session file started:  2026/01/26 22:29:04
+# Build 24.2 2024-05-13T19:43:02.093980
+
+COMMAND FILE:
+  CFX Pre Version = 24.2
+END
+
+>load filename=/home/irtiza/mesh/remesh/sample41.def, mode=def, \
+recoverSession=no, replaceFlow=yes, overwrite=yes
+> update
+
+> update
+>gtmAction, op=deleteComposite, prop
+>gtmAction, op=deleteAssembly, Assembly 2
+> update
+
+> gtmImport filename=/home/irtiza/mesh/remesh/\
+ORCA_gridsample_blade43.cas, type=Fluent, units=m, genOpt= -n, nameStrategy= \
+Assembly
+> update
+
+LIBRARY:
+  CEL:
+    EXPRESSIONS:
+      J=0.5
+    END
+  END
+END
+> update
+
+
+LIBRARY:
+  CEL:
+    EXPRESSIONS:
+      n2=Uinf/(J*D)
+    END
+  END
+END
+> update
+
+> update
+LIBRARY:
+  CEL:
+    EXPRESSIONS:
+      omega= 2*pi*(n2*1 [radian])
+    END
+  END
+END
+> update
+
+>writeCaseFile filename=/home/irtiza/mesh/remesh/sample43_infill.def,operation=\
+write def file
+> update
+
+> update
+
+# Session file stopped:  2026/01/26 22:34:35

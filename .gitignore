@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Generated geometry (written per case by the CAD stage)
+geometry/
+*.iges
+*.igs
+*.stl
+ORCA*.dat
+
+# CFD run artefacts
+*.def
+*.res
+*.out
+*.bak
+create_def_updated_*.pre
+export*.csv
+
+# Sampling / training data written by the pipeline
+New_training/
+generated_*_control_points.txt
+rejected_*_control_points.txt
+input__var_values_*.dat
+max_pred_mu_history.txt
+generation_history.txt
+Results_*.txt
+poly_fit_eq_*.txt
+*_predictions.txt
+diag.txt
+
+# REQUIRED inputs: these match patterns above but must stay tracked.
+!airfoil_data_fixed.csv
+!create_def.pre
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
