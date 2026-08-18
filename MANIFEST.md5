@@ -6,8 +6,6 @@ abf2067951da7f5239018bfddb886e46  Main_PSO.py
 b4465503baa82b1f927c828323c9979c  PSO_function.py
 bbcc8ab6a72ca11b65ab5e5d18d456d2  Run_CFD.py
 faca25b0de6bb5e292f6d95094382a35  X_CAD_new.py
-a43c6dc393e0177c7ecf6e2051f1cc0a  _diag_new.py
-62c7e84931ffe00943baa0267778c93a  _tip_test_new.py
 c6404849737e6b7aba9fc9a0d183ca0d  blade_cuts_new.py
 aee2f3612f42a49f9d02b9a6f6c8c959  blade_surface_new.py
 a57dd328281f96a424ad94c8aefc1a88  bound_check.py
