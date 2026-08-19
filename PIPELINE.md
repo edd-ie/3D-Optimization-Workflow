@@ -48,24 +48,45 @@ one driver script:                7 stages, run by hand:
 
 ### One round, start to finish
 
-```mermaid
-flowchart TD
-    S1["STAGE 1 — propose designs<br/><b>Initial_sampling.py</b>"]
-    S2["STAGE 2 — build CAD<br/><b>Initial_sampling.py</b> again,<br/>INPUT_MODE = 'infill'"]
-    S3["STAGE 3 — mesh<br/><b>grid_samples_eg.py</b><br/>(Pointwise machine)"]
-    S4["STAGE 4 — CFD<br/><b>generate_def.py → Run_CFD.py</b>"]
-    S5["STAGE 5 — collect<br/><b>get_results.py</b>"]
-    S6["STAGE 6 — build training set<br/><b>prop_training.py</b>"]
-    S7["STAGE 7 — fit GP, propose next<br/><b>gp_infill_from_training_data.py</b>"]
+```
+   ROUND N
+   =======
 
-    S1 -->|"control_points.txt"| S2
-    S2 -->|"sample_blade&lt;case&gt;.iges"| S3
-    S3 -->|"mesh"| S4
-    S4 -->|"...__001.res"| S5
-    S5 -->|"Results_&lt;tag&gt;.txt"| S6
-    S6 -->|"training_data_&lt;tag&gt;.dat"| S7
-    S7 -->|"next control_points.txt"| S2
-
+   [STAGE 1]  propose designs          Initial_sampling.py
+              (LHS, first round only)   INPUT_MODE = "lhs"
+                    |
+                    |  <tag>_control_points.txt
+                    v
+   [STAGE 2]  build CAD                Initial_sampling.py  <-- same file
+                                        INPUT_MODE = "infill"
+                                        calls X_blade + X_CAD per case
+                    |
+                    |  geometry/<tag>/sample_blade<case>.iges   (~2 MB each)
+                    v
+   [STAGE 3]  mesh                     grid_samples_eg.py
+              (Pointwise machine)
+                    |
+                    |  mesh files
+                    v
+   [STAGE 4]  CFD                      generate_def.py -> Run_CFD.py
+              (cluster, hours)
+                    |
+                    |  sample<case>_infill_001.res
+                    v
+   [STAGE 5]  collect results          get_results.py
+                    |
+                    |  New_training/Results_<tag>.txt
+                    v
+   [STAGE 6]  build training set       prop_training.py
+                    |
+                    |  New_training/training_data_<tag>.dat   (13 columns)
+                    v
+   [STAGE 7]  fit GP, propose next     gp_infill_from_training_data.py
+                    |
+                    |  next <tag>_control_points.txt
+                    |
+                    +---------> back to STAGE 2  (NOT stage 1)
+                                bump INFILL_ROUND in pipeline_config.py
 ```
 
 Note the loop closes on **stage 2, not stage 1**. Stage 1 (LHS sampling) only
