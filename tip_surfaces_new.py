@@ -916,7 +916,13 @@ def build_drdc_grids(blade, cfg=None, verbose=True, row_cache=None):
                   ("tip", tip_rows), ("central_pressure", cp),
                   ("central_suction", cs))}
 
+    # design hub radius (m): the hub is sized from the DESIGN root, never
+    # from the (root-extended) ring the patches actually reach
+    hub_radius = getattr(blade, "r_root_design",
+                         getattr(blade, "r_root", None))
+    hub_radius = None if hub_radius is None else hub_radius * blade.d / 2.0
     meta = dict(cfg=cfg, N=N, N_t=N_t, L_outline=L, s_tip=s_tip,
+                hub_radius=hub_radius,
                 j_te=j_te, j_le=j_le, t_common=t_common,
                 eta_min=blade.eta_min, r_tip=blade.r_tip,
                 reversals=reversals,

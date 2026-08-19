@@ -109,6 +109,7 @@ def _edge_root_point(grids, key, theta_ref):
 
 
 def hub_grids(grids, hub_height=None, hub_center=DEFAULT_HUB_CENTER,
+              hub_radius=None,
               n_blades=DEFAULT_N_BLADES,
               n_s=DEFAULT_N_S, n_x=DEFAULT_N_X, n_rho=25,
               cap_inner_radius=0.0, verbose=True):
@@ -141,6 +142,15 @@ def hub_grids(grids, hub_height=None, hub_center=DEFAULT_HUB_CENTER,
     if Z < 2:
         raise ValueError("n_blades must be >= 2")
     info = root_ring_from_grids(grids)
+    # With the root-extended blade the measured ring sits BELOW the hub
+    # surface on purpose; the hub must keep the DESIGN root radius.
+    if hub_radius is None:
+        hub_radius = grids.get("meta", {}).get("hub_radius")
+    if hub_radius is not None:
+        info["ring_immersion"] = float(hub_radius) - info["radius"]
+        info["radius"] = float(hub_radius)
+    else:
+        info["ring_immersion"] = 0.0
     R, span, th_ref = info["radius"], info["span"], info["theta_ref"]
     x_c = (0.5 * (info["x_lo"] + info["x_hi"]) if hub_center is None
            else float(hub_center))
@@ -255,7 +265,10 @@ def hub_grids(grids, hub_height=None, hub_center=DEFAULT_HUB_CENTER,
                 xi_le=xi_le, th_le=th_le, xi_te=xi_te, th_te=th_te)
 
     log(f"[hub] Sec. 10 sector: Z = {Z}, width {np.degrees(2*half):.2f} deg, "
-        f"radius {R:.6f} m (measured, spread {info['spread']:.1e} m)")
+        f"radius {R:.6f} m"
+        + (f" (design root; blade ring sunk {info['ring_immersion']*1000:.1f}"
+           f" mm below the hub surface for the manual trim)"
+           if info['ring_immersion'] > 1e-9 else " (measured from ring)"))
     log(f"[hub] height {H:.4f} m, axial [{xi_lo:.4f}, {xi_hi:.4f}] m "
         f"(root ring spans [{info['x_lo']:.4f}, {info['x_hi']:.4f}])")
     log(f"[hub] centre curve: LE ({xi_le:.4f}, {np.degrees(th_le):.2f} deg) "

@@ -185,63 +185,8 @@ def _apply_orientation(grid, name):
     return np.ascontiguousarray(g)
 
 
-# Root skirt depth (m). The blade root ring lies ON the hub surface to
-# machine precision at the shared sample points, but BETWEEN samples both
-# surfaces are cubic B-splines that deviate from the exact cylinder by up to
-# ~0.3 um, each on its own side. The contact is therefore tangency within a
-# band of about +-1 um: the worst case for a mesher's intersection logic, and
-# the reason blade and hub failed to assemble in Pointwise. The robust
-# practice is to make the surfaces clearly INTERSECT: the blade root section
-# is copied radially inward and the band between the copy and the root ring
-# is exported as extra "skirt" faces. The mesher trims the blade at the hub
-# and discards the skirt, which lies entirely inside the hub.
-#
-# The skirt is deliberately SEPARATE faces rather than extra rows prepended
-# to the blade grids: prepending rows bends the global interpolating spline
-# and was measured to deform the wetted blade by 1.4-2.5 mm in the first
-# radial band. As separate ruled faces the wetted blade is byte-identical to
-# the validated geometry, and the tangent kink between blade and skirt lies
-# exactly on the hub surface, where the trim removes it.
-ROOT_SKIRT_DEPTH = 0.003
-
-# skirt faces sewn to their parent patches (parent key -> face label)
-SKIRT_PARENTS = [
-    ("te_strip", "Blade 1 skirt"),
-    ("central_pressure", "Blade 2 skirt"),
-    ("le_strip", "Blade 3 skirt"),
-    ("central_suction", "Blade 4 skirt"),
-]
-
-
-def build_root_skirts(grids, depth=ROOT_SKIRT_DEPTH, n_rows=4):
-    """Ruled skirt grids below the root ring: exact radial copies inward.
-
-    For each root-touching patch, every point p of its root row is scaled in
-    (y, z) toward the axis so the copies sit at radius r0 - depth ... r0.
-    The LAST skirt row is the parent's root row itself, so the shared edge
-    coincides point-for-point (and, fitted with the same column parameters,
-    curve-for-curve), which lets the sewing merge skirt and blade exactly.
-    Rows are colinear per column, so the fitted surface is exactly ruled.
-    """
-    out = {}
-    for key, _ in SKIRT_PARENTS:
-        g = np.asarray(grids[key], dtype=float)
-        p0 = g[0]
-        r0 = np.hypot(p0[:, 1], p0[:, 2])
-        rows = []
-        for k in range(n_rows):
-            scale = (r0 - depth * (1.0 - k / (n_rows - 1.0))) / r0
-            q = p0.copy()
-            q[:, 1] *= scale
-            q[:, 2] *= scale
-            rows.append(q)
-        rows[-1] = p0                      # shared edge, exact
-        out[key] = np.stack(rows, axis=0)
-    return out
-
-
 def X_CAD(grids, x1, output_dir=None, hub=True, hub_height=None,
-          hub_center=0.0, n_blades=5, root_skirt=ROOT_SKIRT_DEPTH):
+          hub_center=0.0, n_blades=5):
     """Build the five-surface DRDC blade (plus hub) and write it to IGES.
 
     grids      : dict from tip_surfaces_new.build_drdc_grids()
@@ -252,12 +197,12 @@ def X_CAD(grids, x1, output_dir=None, hub=True, hub_height=None,
                  from the blade root ring and takes no input.
     n_blades   : Z; the sector spans exactly 2 pi / Z and Z rotated copies
                  reproduce the full hub (TM 2013-178 Sec. 10, Fig. 9).
-    root_skirt : depth (m) of the radial root-skirt faces sunk below the
-                 hub surface so blade and hub clearly intersect. NOTHING is
-                 trimmed here: the file carries the full extended geometry
-                 and the blade-at-hub trim is done manually in Pointwise.
-                 0 or None disables. The wetted blade faces are identical
-                 with or without the skirt.
+
+    The five blade patches are ROOT-EXTENDED: the blade surface starts
+    ROOT_EXTENSION (blade_surface_new, default 3 mm) below the design root
+    radius, while the hub keeps the design radius (meta['hub_radius']), so
+    blade and hub clearly intersect. Nothing is trimmed in the file; the
+    blade-at-hub trim is done manually in Pointwise.
 
     The hub goes through the SAME grid -> self-verified-B-spline path as
     the blade patches, so it arrives in the IGES as bounded entity-128
@@ -287,24 +232,6 @@ def X_CAD(grids, x1, output_dir=None, hub=True, hub_height=None,
         faces.append((label, face))
         sewing.Add(face)
 
-    if root_skirt and root_skirt > 0:
-        skirts = build_root_skirts(grids, depth=root_skirt)
-        for key, label in SKIRT_PARENTS:
-            # same column parameters as the parent patch, so the shared root
-            # edge is the SAME 1D spline in both fits: they coincide exactly,
-            # between nodes included
-            v_params = None
-            if key in ("te_strip", "le_strip") and t_common is not None:
-                v_params = t_common
-            srf = grid_to_bspline_surface(skirts[key], v_params=v_params)
-            face = BRepBuilderAPI_MakeFace(srf, 1.0e-6).Face()
-            faces.append((label, face))
-            sewing.Add(face)
-        print(f"[X_CAD] root skirt: 4 ruled faces sunk {root_skirt*1000:.1f} "
-              f"mm below the hub surface. Nothing is trimmed in the file; "
-              f"trim blade-at-hub manually in Pointwise. Wetted blade "
-              f"unchanged.")
-
     if hub:
         for label, key in (("Hub", "hub_sector"),
                            ("Hub cap lo", "hub_cap_lo"),
@@ -325,8 +252,7 @@ def X_CAD(grids, x1, output_dir=None, hub=True, hub_height=None,
     iges_path = paths["iges"]
     write_iges_file(shape, str(iges_path))
     n_srf = len(faces)
-    print(f"IGES file written ({n_srf} faces: 5 blade"
-          + (" + 4 root skirt" if root_skirt and root_skirt > 0 else "")
+    print(f"IGES file written ({n_srf} faces: 5 blade (root-extended)"
           + (" + hub sector + 2 caps" if hub else "") + f"): {iges_path}")
     return shape
 
@@ -334,7 +260,7 @@ def X_CAD(grids, x1, output_dir=None, hub=True, hub_height=None,
 def X_CAD_from_design(pitch_con, chord_con, x1, output_dir=None,
                       tip_config=None, write_dat=False, verbose=True,
                       hub=True, hub_height=None, hub_center=0.0,
-                      n_blades=5, root_skirt=ROOT_SKIRT_DEPTH):
+                      n_blades=5):
     """Convenience wrapper: design vector -> DRDC grids -> IGES.
 
     Drop-in for workers that previously called
@@ -356,4 +282,4 @@ def X_CAD_from_design(pitch_con, chord_con, x1, output_dir=None,
                              verbose=verbose)
     return X_CAD(grids, x1, output_dir=output_dir, hub=hub,
                  hub_height=hub_height, hub_center=hub_center,
-                 n_blades=n_blades, root_skirt=root_skirt)
+                 n_blades=n_blades)

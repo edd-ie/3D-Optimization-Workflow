@@ -63,6 +63,15 @@ TE_BLEND_START = 0.995       # station where the blunt TE cap begins
 CLOSE_CHORD = 0.010
 CHORD_FLOOR = 1.0e-4         # minimum chord (per diameter) treated as "closed"
 
+# Root extension (m). The blade surface starts this far BELOW the design
+# root radius, so the five patches themselves run past the hub surface and
+# blade and hub clearly intersect (the blade-at-hub trim is done manually in
+# the mesher). Below the design root the property interpolators clamp to
+# their first value, which makes the extension an exact copy of the root
+# section carried inward. The hub keeps the DESIGN root radius: it is sized
+# from r_root_design, never from the extended ring.
+ROOT_EXTENSION = 0.003
+
 # ---------------------------------------------------------------------------
 # Tip chord taper
 # ---------------------------------------------------------------------------
@@ -337,6 +346,7 @@ class BladeSurface:
     def __init__(self, max_camber, pitch, chord_length, max_thickness,
                  skew_angle, rake,
                  d=PROP_DIAMETER, r_root=R_ROOT_DEFAULT,
+                 root_extension=ROOT_EXTENSION,
                  tip_close_start=None, close_chord=CLOSE_CHORD,
                  chord_floor=CHORD_FLOOR, thick_floor=True,
                  taper_start=TIP_TAPER_START):
@@ -358,7 +368,12 @@ class BladeSurface:
         self.MaxThickness = self._thickness_floor(max_thickness)
         self.SkewAngle = skew_angle
         self.Rake = rake
-        self.r_root = float(r_root)
+        self.r_root_design = float(r_root)
+        ext = float(root_extension or 0.0)
+        # extension is given in metres; r_root is per-radius (r/R)
+        self.r_root = self.r_root_design - ext / (self.d / 2.0)
+        if self.r_root <= 0.0:
+            raise ValueError("root_extension larger than the root radius")
         self.chord_floor = float(chord_floor)
 
         # the canonical family must see the SAME floored thickness, since the
