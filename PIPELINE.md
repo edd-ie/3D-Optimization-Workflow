@@ -21,17 +21,20 @@ of designs. You cannot hold that inside a Python loop. So the loop is **broken
 into stages that you run by hand**, and the "training" is **offline**: the GP
 is fitted separately from the CFD, on results that already exist on disk.
 
-```mermaid
-flowchart LR
-    subgraph TWO["2D slat workflow"]
-        A["one driver script<br/>loops internally"] --> A
-    end
-    subgraph THREE["this workflow"]
-        B["stage 1"] --> C["stage 2"] --> D["stage 3"] --> E["stage 4"]
-        E -.->|"you start the next round"| B
-    end
-    style TWO fill:#ffeaea
-    style THREE fill:#eaf4ff
+```
+2D slat workflow                  this workflow
+------------------                ------------------------------
+one driver script:                7 stages, run by hand:
+  init                              1  propose designs   (python)
+  loop:                             2  build CAD         (python)
+    call CFD  <-- in-process        3  mesh              (Pointwise)
+    fit model                       4  CFD               (cluster, hours)
+    propose                         5  collect results   (python)
+  finalise                          6  build training set(python)
+                                    7  fit GP + propose  (python)
+                                       ^                   |
+                                       +-- you start ------+
+                                           the next round
 ```
 
 **Consequences for you as the builder:**
@@ -63,9 +66,6 @@ flowchart TD
     S6 -->|"training_data_&lt;tag&gt;.dat"| S7
     S7 -->|"next control_points.txt"| S2
 
-    style S1 fill:#e8f0ff
-    style S7 fill:#e8f5e9
-    style S3 fill:#eeeeee
 ```
 
 Note the loop closes on **stage 2, not stage 1**. Stage 1 (LHS sampling) only
