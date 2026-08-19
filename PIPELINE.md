@@ -1,71 +1,176 @@
-# Pipeline Interface Reference
+# Propeller Optimization Workflow — Build Guide
 
-Black-box spec for each **script**: parameters in, data out, and what connects
-to what. Treat each box as a function with a contract.
+For someone seeing this workflow for the first time. Read section 1 before
+anything else; it explains the shape of the thing, which is different from the
+2D slat workflow.
 
 Reference case throughout: 5 blades, diameter `D = 1.4 m`.
 
 ---
 
-## 0. Where to begin — the two overseer scripts
+## 1. Read this first: how this workflow is shaped
 
-There is no single "run everything" file. The pipeline runs as **two driver
-scripts**, one per phase, with an external CFD step between them:
+### It is NOT one script that loops
 
-| Phase | Run this | Does |
-|---|---|---|
-| 1. Initial sampling | **`Initial_sampling.py`** | generates the first batch of designs (LHS) and their CAD |
-| 2. Every later round | **`gp_infill_from_training_data.py`** | fits the GP on all results so far and proposes the next designs |
+In the 2D slat workflow, one file (`gp_training_patched.py` / `pso.py`) owns
+the whole optimization: it initialises, calls the CFD, loops, and finalises.
+**This workflow does not work that way.**
 
-`gp_infill_from_training_data.py` is the closest equivalent to
-`gp_training_patched.py` / `pso.py` in the slat workflow. Its PSO variant is
-`gp_infill_from_training_data_pso.py` (same in/out, different acquisition
-optimizer).
+Here the CFD is a 3D RANS simulation on a cluster — hours per design, hundreds
+of designs. You cannot hold that inside a Python loop. So the loop is **broken
+into stages that you run by hand**, and the "training" is **offline**: the GP
+is fitted separately from the CFD, on results that already exist on disk.
 
-Between the two phases you run, in order:
-
+```mermaid
+flowchart LR
+    subgraph TWO["2D slat workflow"]
+        A["one driver script<br/>loops internally"] --> A
+    end
+    subgraph THREE["this workflow"]
+        B["stage 1"] --> C["stage 2"] --> D["stage 3"] --> E["stage 4"]
+        E -.->|"you start the next round"| B
+    end
+    style TWO fill:#ffeaea
+    style THREE fill:#eaf4ff
 ```
-generate_def.py  →  Run_CFD.py  →  get_results.py  →  prop_training.py
-```
 
-`prop_training.py` is the one that turns raw CFD output into the GP training
-file — do not skip it.
+**Consequences for you as the builder:**
 
-Everything else in this folder is a **library**, imported by these drivers.
-You never run it directly.
+- No script calls the CFD solver and waits for it. Each stage ends by writing
+  files; the next stage starts by reading them.
+- **`gp_infill_from_training_data.py` does not call `X_blade` or `X_CAD`.** It
+  only proposes new design vectors and writes them to a file.
+- The handoff between every stage is **a file on disk**, never a function
+  return. That is what makes the stages independently restartable.
 
----
-
-## 1. Data flow (by file name)
+### One round, start to finish
 
 ```mermaid
 flowchart TD
-    IS["Initial_sampling.py<br/>(driver, phase 1)"]
-    IS -->|"11 floats per case"| CW["cad_worker.py<br/>(subprocess)"]
-    CW --> XC["X_CAD_new.py<br/>X_CAD_from_design()"]
-    XC -.->|"calls"| XB["x_blade_new.py"]
-    XB -.->|"calls"| TS["tip_surfaces_new.py"]
-    TS -.->|"calls"| HB["hub_new.py"]
-    XC -->|"sample_blade&lt;case&gt;.iges<br/>~2 MB, 8 surfaces"| PW["Pointwise<br/>(external, manual)"]
-    PW -->|"mesh"| GD["generate_def.py"]
-    GD -->|"sample&lt;case&gt;_infill.def"| RC["Run_CFD.py"]
-    RC -->|"...__001.res"| GR["get_results.py"]
-    GR -->|"Results_&lt;tag&gt;.txt"| PT["prop_training.py"]
-    PT -->|"training_data_&lt;tag&gt;.dat"| GP["gp_infill_from_training_data.py<br/>(driver, phase 2)"]
-    GP -->|"next 11 floats per case"| CW
+    S1["STAGE 1 — propose designs<br/><b>Initial_sampling.py</b>"]
+    S2["STAGE 2 — build CAD<br/><b>Initial_sampling.py</b> again,<br/>INPUT_MODE = 'infill'"]
+    S3["STAGE 3 — mesh<br/><b>grid_samples_eg.py</b><br/>(Pointwise machine)"]
+    S4["STAGE 4 — CFD<br/><b>generate_def.py → Run_CFD.py</b>"]
+    S5["STAGE 5 — collect<br/><b>get_results.py</b>"]
+    S6["STAGE 6 — build training set<br/><b>prop_training.py</b>"]
+    S7["STAGE 7 — fit GP, propose next<br/><b>gp_infill_from_training_data.py</b>"]
 
-    style IS fill:#e8f0ff
-    style GP fill:#e8f5e9
-    style XC fill:#fff3e0
-    style PW fill:#eeeeee
+    S1 -->|"control_points.txt"| S2
+    S2 -->|"sample_blade&lt;case&gt;.iges"| S3
+    S3 -->|"mesh"| S4
+    S4 -->|"...__001.res"| S5
+    S5 -->|"Results_&lt;tag&gt;.txt"| S6
+    S6 -->|"training_data_&lt;tag&gt;.dat"| S7
+    S7 -->|"next control_points.txt"| S2
+
+    style S1 fill:#e8f0ff
+    style S7 fill:#e8f5e9
+    style S3 fill:#eeeeee
 ```
 
-Solid arrows = data handed between steps. Dotted = internal library calls you
-do not invoke yourself.
+Note the loop closes on **stage 2, not stage 1**. Stage 1 (LHS sampling) only
+happens once, at the very beginning. Every round after that starts from the
+GP's suggestions.
+
+### The one thing that confuses everybody
+
+`Initial_sampling.py` is used **twice, for two different jobs**, controlled by
+one variable at the top of the file:
+
+```python
+INPUT_MODE = "lhs"      # stage 1: GENERATE new design vectors (first round only)
+INPUT_MODE = "infill"   # stage 2: do NOT generate; read the GP's suggestions
+                        #          and build CAD for them
+```
+
+In `"infill"` mode it generates no new samples. It reads the control points
+the GP wrote, then calls `X_blade` and `X_CAD` per case to produce the IGES
+files. That is the only place `X_blade` and `X_CAD` are invoked in a normal
+round.
+
+Other modes: `"existing"` (read a specific control-points file), `"test"`
+(short smoke run, case ids from 1001).
+
+### What each stage costs
+
+| Stage | Runs where | Typical cost |
+|---|---|---|
+| 1 propose (LHS) | laptop | seconds |
+| 2 CAD | laptop, `pyocc310` | **~90 s per design** |
+| 3 mesh | Pointwise machine | minutes per design |
+| 4 CFD | cluster | **hours per design** |
+| 5 collect | laptop | seconds |
+| 6 training set | laptop | seconds |
+| 7 GP + propose | laptop | minutes |
+
+Stages 3 and 4 are why the loop is manual.
 
 ---
 
-## 2. Design vector — the only pipeline input
+## 2. What to run, in order
+
+**First round only:**
+
+```bash
+# stage 1 — set INPUT_MODE = "lhs" in Initial_sampling.py
+python Initial_sampling.py
+```
+
+**Every round (including the first, after stage 1):**
+
+```bash
+# stage 2 — set INPUT_MODE = "infill"
+conda activate pyocc310
+python Initial_sampling.py          # -> sample_blade<case>.iges
+
+# stage 3 — on the Pointwise machine
+python grid_samples_eg.py           # -> meshes
+
+# stage 4 — CFD
+python generate_def.py              # -> sample<case>_infill.def
+python Check_def.py                 # optional validation
+python Run_CFD.py                   # -> ...__001.res
+
+# stage 5 — collect
+python get_results.py               # -> Results_<tag>.txt
+
+# stage 6 — build the GP training set   <-- easy to forget, do not skip
+python prop_training.py             # -> training_data_<tag>.dat
+
+# stage 7 — fit GP, propose next designs
+python gp_infill_from_training_data.py
+```
+
+Then bump `INFILL_ROUND` in `pipeline_config.py` and go back to stage 2.
+
+`gp_infill_from_training_data_pso.py` is a drop-in alternative to stage 7
+(same in and out, PSO instead of ESPSOLS for the acquisition search).
+
+---
+
+## 3. Where state lives
+
+Every stage communicates through files. `pipeline_config.py` defines all of
+them, keyed off **`INFILL_ROUND`** — one variable that tags the whole round.
+
+| Stage writes | File | Read by |
+|---|---|---|
+| 7 (or 1) | `<tag>_control_points.txt` | stage 2 |
+| 2 | `geometry/<tag>/sample_blade<case>.iges` | stage 3 |
+| 4 | `sample<case>_infill_001.res` | stage 5 |
+| 5 | `New_training/Results_<tag>.txt` | stage 6 |
+| 6 | `New_training/training_data_<tag>.dat` | stage 7 |
+
+Because each stage only needs the files before it, any stage can be re-run
+alone. A crashed CAD batch resumes: cases whose IGES already exists are
+skipped.
+
+**Start by reading `pipeline_config.py`.** It is the map of the whole
+workflow.
+
+---
+
+## 4. Design vector — the only pipeline input
 
 `pitch_con` (6 floats) + `chord_con` (5 floats) = **11 floats**, all bounded.
 
@@ -88,9 +193,9 @@ Defined in `Initial_sampling.py` (`pitch_bounds`, `chord_bounds`). Must match
 
 ---
 
-## 3. Geometry components
+## 5. Component reference — geometry
 
-### 3.1 `x_blade_new.py` — function `X_blade()`
+### 5.1 `x_blade_new.py` — function `X_blade()`
 
 ```python
 X_blade(pitch_con, chord_con, x1, *,
@@ -127,7 +232,7 @@ X_blade(pitch_con, chord_con, x1, *,
 > Check `constraint_violation` before continuing. Infeasible designs must not
 > reach the CAD stage.
 
-### 3.2 `tip_surfaces_new.py` — function `build_drdc_grids()`
+### 5.2 `tip_surfaces_new.py` — function `build_drdc_grids()`
 
 ```python
 build_drdc_grids(blade, cfg=None, verbose=True, row_cache=None)
@@ -165,7 +270,7 @@ build_drdc_grids(blade, cfg=None, verbose=True, row_cache=None)
 Halving `delta_c` roughly doubles grid size and runtime. All other fields have
 working defaults; changing them is not required to run the pipeline.
 
-### 3.3 `hub_new.py` — function `hub_grids()`
+### 5.3 `hub_new.py` — function `hub_grids()`
 
 ```python
 hub_grids(grids, hub_height=None, hub_center=0.0, n_blades=5,
@@ -201,7 +306,7 @@ directly).
 **Raises** if the hub can't be built correctly (non-cylindrical root, hub too
 short, or blades would overlap at the chosen `n_blades`).
 
-### 3.4 `X_CAD_new.py` — functions `X_CAD()` / `X_CAD_from_design()` *(needs pythonOCC)*
+### 5.4 `X_CAD_new.py` — functions `X_CAD()` / `X_CAD_from_design()` *(needs pythonOCC)*
 
 ```python
 X_CAD(grids, x1, output_dir=None, hub=True, hub_height=None,
@@ -248,7 +353,7 @@ X_CAD_from_design([1.025, 0.525, 0.55, 0.325, 0.325, 0.55],
 > Raises rather than writing bad geometry if any surface fails its
 > export check.
 
-### 3.5 `cad_worker.py` — subprocess wrapper (CLI)
+### 5.5 `cad_worker.py` — subprocess wrapper (CLI)
 
 ```bash
 python cad_worker.py <case_id> <geometry_dir> <design_path>
@@ -260,9 +365,9 @@ platform schedules CAD jobs itself.
 
 ---
 
-## 4. Sampling
+## 6. Component reference — sampling driver
 
-### `Initial_sampling.py` — DRIVER, phase 1
+### `Initial_sampling.py` — stages 1 and 2
 
 | | |
 |---|---|
@@ -275,7 +380,7 @@ stall the batch.
 
 ---
 
-## 5. CFD chain (external solver)
+## 7. Component reference — CFD chain
 
 | Component | In | Out | Size |
 |---|---|---|---|
@@ -292,10 +397,10 @@ case   J   kT   kQ   thrust   torque   drag   total_resistance   CD   CP
 
 ---
 
-## 5b. `prop_training.py` — CFD results → GP training data
+## 8. `prop_training.py` — CFD results → GP training data
 
-The bridge between CFD and the surrogate. **Run this after `get_results.py`
-and before `gp_infill_from_training_data.py`.**
+The bridge between CFD and the surrogate. **Stage 6. Run after `get_results.py`, before
+`gp_infill_from_training_data.py`.**
 
 ```bash
 python prop_training.py
@@ -326,9 +431,9 @@ the objective values.
 
 ---
 
-## 6. Surrogate / infill
+## 9. Component reference — surrogate driver
 
-### `gp_infill_from_training_data.py` — DRIVER, phase 2
+### `gp_infill_from_training_data.py` — stage 7
 
 | | |
 |---|---|
@@ -344,7 +449,7 @@ feasible/infeasible prediction, used to skip designs likely to fail.
 
 ---
 
-## 7. File and directory contract
+## 10. File and directory contract
 
 | Path | Written by | Read by |
 |---|---|---|
@@ -366,7 +471,7 @@ Create them or repoint `DATA_DIR` in `pipeline_config.py`.
 
 ---
 
-## 8. Environment
+## 11. Environment
 
 | Component | Requirement |
 |---|---|
@@ -375,7 +480,7 @@ Create them or repoint `DATA_DIR` in `pipeline_config.py`.
 
 ---
 
-## 9. Cost per design
+## 12. Cost per design
 
 | Stage | Time | Output |
 |---|---|---|
@@ -392,19 +497,20 @@ to trade surface resolution for speed.
 
 ---
 
-## 10. File index — what each script is for
+## 13. File index — what each script is for
 
 **Drivers (you run these):**
 
 | File | Role |
 |---|---|
-| `Initial_sampling.py` | phase 1: LHS designs + CAD |
+| `Initial_sampling.py` | stages 1 & 2: propose designs (`lhs`) and build CAD (`infill`) |
+| `grid_samples_eg.py` | stage 3: drives Pointwise meshing (**runs on the Pointwise machine**) |
 | `generate_def.py` | build CFX `.def` per case |
 | `Run_CFD.py` | submit/solve CFX |
 | `Check_def.py` | validate `.def` files |
 | `get_results.py` | `.res` → `Results_<tag>.txt` |
-| `prop_training.py` | results → `training_data_<tag>.dat` |
-| `gp_infill_from_training_data.py` | phase 2: GP + next designs |
+| `prop_training.py` | stage 6: results → `training_data_<tag>.dat` |
+| `gp_infill_from_training_data.py` | stage 7: GP fit + next designs |
 | `gp_infill_from_training_data_pso.py` | same, PSO acquisition |
 | `Gp_classifier.py` | feasibility classifier (optional) |
 | `job_submission.py` | cluster job submission helper |
