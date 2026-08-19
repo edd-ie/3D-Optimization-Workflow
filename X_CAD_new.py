@@ -253,9 +253,11 @@ def X_CAD(grids, x1, output_dir=None, hub=True, hub_height=None,
     n_blades   : Z; the sector spans exactly 2 pi / Z and Z rotated copies
                  reproduce the full hub (TM 2013-178 Sec. 10, Fig. 9).
     root_skirt : depth (m) of the radial root-skirt faces sunk below the
-                 hub surface so blade and hub clearly intersect for the
-                 mesher's trim. 0 or None disables. The wetted blade faces
-                 are identical with or without the skirt.
+                 hub surface so blade and hub clearly intersect. NOTHING is
+                 trimmed here: the file carries the full extended geometry
+                 and the blade-at-hub trim is done manually in Pointwise.
+                 0 or None disables. The wetted blade faces are identical
+                 with or without the skirt.
 
     The hub goes through the SAME grid -> self-verified-B-spline path as
     the blade patches, so it arrives in the IGES as bounded entity-128
@@ -299,8 +301,9 @@ def X_CAD(grids, x1, output_dir=None, hub=True, hub_height=None,
             faces.append((label, face))
             sewing.Add(face)
         print(f"[X_CAD] root skirt: 4 ruled faces sunk {root_skirt*1000:.1f} "
-              f"mm below the hub surface (mesher trims at the hub); wetted "
-              f"blade unchanged")
+              f"mm below the hub surface. Nothing is trimmed in the file; "
+              f"trim blade-at-hub manually in Pointwise. Wetted blade "
+              f"unchanged.")
 
     if hub:
         for label, key in (("Hub", "hub_sector"),
