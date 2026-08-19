@@ -22,6 +22,7 @@ ff1df8396f741b7eebf619fa97f21e15  para.py
 7cd90971c95a247fc8cfe8dcd8e04452  penalty.py
 7d4d0a4de5883aca2a0f8fcf327d8078  pipeline_config.py
 6ecf2cdf726cc8fe0537ad4064ee40c5  pipeline_io.py
+bb1ab16a4e38ab72fb00eda67a1c9c4d  prop_training.py
 c8750d53bf5e1697c97d6d4885a8736a  repair.py
 5aeee6d225591dcd3d12d9535f5afbcc  rot_axis.py
 a1b53082e6499512dd775647d9ea1b1a  skew_symmetric_matrix.py

@@ -1,37 +1,67 @@
 # Pipeline Interface Reference
 
-Black-box spec for each component: **parameters in, data out, and what
-connects to what.** No internals — treat each box as a function with a
-contract.
+Black-box spec for each **script**: parameters in, data out, and what connects
+to what. Treat each box as a function with a contract.
 
 Reference case throughout: 5 blades, diameter `D = 1.4 m`.
 
 ---
 
-## 1. Data flow
+## 0. Where to begin — the two overseer scripts
+
+There is no single "run everything" file. The pipeline runs as **two driver
+scripts**, one per phase, with an external CFD step between them:
+
+| Phase | Run this | Does |
+|---|---|---|
+| 1. Initial sampling | **`Initial_sampling.py`** | generates the first batch of designs (LHS) and their CAD |
+| 2. Every later round | **`gp_infill_from_training_data.py`** | fits the GP on all results so far and proposes the next designs |
+
+`gp_infill_from_training_data.py` is the closest equivalent to
+`gp_training_patched.py` / `pso.py` in the slat workflow. Its PSO variant is
+`gp_infill_from_training_data_pso.py` (same in/out, different acquisition
+optimizer).
+
+Between the two phases you run, in order:
+
+```
+generate_def.py  →  Run_CFD.py  →  get_results.py  →  prop_training.py
+```
+
+`prop_training.py` is the one that turns raw CFD output into the GP training
+file — do not skip it.
+
+Everything else in this folder is a **library**, imported by these drivers.
+You never run it directly.
+
+---
+
+## 1. Data flow (by file name)
 
 ```mermaid
 flowchart TD
-    V["design vector<br/>11 floats"]
-    V --> XB["X_blade"]
-    XB -->|"BladeSurface object"| TS["build_drdc_grids"]
-    TS -->|"dict: 5 grids"| HB["hub_grids"]
-    TS -->|"dict: 5 grids"| CAD["X_CAD"]
-    HB -->|"dict: 3 grids"| CAD
-    CAD -->|"sample_blade&lt;case&gt;.iges<br/>~2 MB, 8 surfaces"| MESH["Pointwise<br/>(external)"]
-    MESH -->|"mesh"| DEF["generate_def"]
-    DEF -->|"sample&lt;case&gt;_infill.def"| CFD["Run_CFD"]
-    CFD -->|"...__001.res"| GR["get_results"]
-    GR -->|"Results_&lt;tag&gt;.txt"| GP["gp_infill_from_training_data"]
-    GP -->|"11 floats × N"| V
+    IS["Initial_sampling.py<br/>(driver, phase 1)"]
+    IS -->|"11 floats per case"| CW["cad_worker.py<br/>(subprocess)"]
+    CW --> XC["X_CAD_new.py<br/>X_CAD_from_design()"]
+    XC -.->|"calls"| XB["x_blade_new.py"]
+    XB -.->|"calls"| TS["tip_surfaces_new.py"]
+    TS -.->|"calls"| HB["hub_new.py"]
+    XC -->|"sample_blade&lt;case&gt;.iges<br/>~2 MB, 8 surfaces"| PW["Pointwise<br/>(external, manual)"]
+    PW -->|"mesh"| GD["generate_def.py"]
+    GD -->|"sample&lt;case&gt;_infill.def"| RC["Run_CFD.py"]
+    RC -->|"...__001.res"| GR["get_results.py"]
+    GR -->|"Results_&lt;tag&gt;.txt"| PT["prop_training.py"]
+    PT -->|"training_data_&lt;tag&gt;.dat"| GP["gp_infill_from_training_data.py<br/>(driver, phase 2)"]
+    GP -->|"next 11 floats per case"| CW
 
-    style V fill:#e8f0ff
-    style CAD fill:#fff3e0
+    style IS fill:#e8f0ff
     style GP fill:#e8f5e9
+    style XC fill:#fff3e0
+    style PW fill:#eeeeee
 ```
 
-`X_CAD_from_design` wraps the first four boxes into one call if you don't need
-the intermediates.
+Solid arrows = data handed between steps. Dotted = internal library calls you
+do not invoke yourself.
 
 ---
 
@@ -60,7 +90,7 @@ Defined in `Initial_sampling.py` (`pitch_bounds`, `chord_bounds`). Must match
 
 ## 3. Geometry components
 
-### 3.1 `X_blade` — `x_blade_new.py`
+### 3.1 `x_blade_new.py` — function `X_blade()`
 
 ```python
 X_blade(pitch_con, chord_con, x1, *,
@@ -97,7 +127,7 @@ X_blade(pitch_con, chord_con, x1, *,
 > Check `constraint_violation` before continuing. Infeasible designs must not
 > reach the CAD stage.
 
-### 3.2 `build_drdc_grids` — `tip_surfaces_new.py`
+### 3.2 `tip_surfaces_new.py` — function `build_drdc_grids()`
 
 ```python
 build_drdc_grids(blade, cfg=None, verbose=True, row_cache=None)
@@ -135,7 +165,7 @@ build_drdc_grids(blade, cfg=None, verbose=True, row_cache=None)
 Halving `delta_c` roughly doubles grid size and runtime. All other fields have
 working defaults; changing them is not required to run the pipeline.
 
-### 3.3 `hub_grids` — `hub_new.py`
+### 3.3 `hub_new.py` — function `hub_grids()`
 
 ```python
 hub_grids(grids, hub_height=None, hub_center=0.0, n_blades=5,
@@ -171,7 +201,7 @@ directly).
 **Raises** if the hub can't be built correctly (non-cylindrical root, hub too
 short, or blades would overlap at the chosen `n_blades`).
 
-### 3.4 `X_CAD` / `X_CAD_from_design` — `X_CAD_new.py` *(needs pythonOCC)*
+### 3.4 `X_CAD_new.py` — functions `X_CAD()` / `X_CAD_from_design()` *(needs pythonOCC)*
 
 ```python
 X_CAD(grids, x1, output_dir=None, hub=True, hub_height=None,
@@ -218,7 +248,7 @@ X_CAD_from_design([1.025, 0.525, 0.55, 0.325, 0.325, 0.55],
 > Raises rather than writing bad geometry if any surface fails its
 > export check.
 
-### 3.5 `cad_worker.py` — subprocess wrapper
+### 3.5 `cad_worker.py` — subprocess wrapper (CLI)
 
 ```bash
 python cad_worker.py <case_id> <geometry_dir> <design_path>
@@ -232,7 +262,7 @@ platform schedules CAD jobs itself.
 
 ## 4. Sampling
 
-### `Initial_sampling.py`
+### `Initial_sampling.py` — DRIVER, phase 1
 
 | | |
 |---|---|
@@ -262,9 +292,43 @@ case   J   kT   kQ   thrust   torque   drag   total_resistance   CD   CP
 
 ---
 
+## 5b. `prop_training.py` — CFD results → GP training data
+
+The bridge between CFD and the surrogate. **Run this after `get_results.py`
+and before `gp_infill_from_training_data.py`.**
+
+```bash
+python prop_training.py
+```
+
+No arguments — all paths come from `pipeline_config.infill_paths()`, keyed off
+`INFILL_ROUND`.
+
+| | |
+|---|---|
+| **In** | `Results_<tag>.txt` (from `get_results.py`) — needs >= 10 columns |
+| **In** | `<tag>_control_points_con_points.txt` — the 11 design vars per case |
+| **Out** | **`training_data_<tag>.dat`** — 13 columns: 11 design vars + 2 objectives |
+| **Out** | `poly_fit_eq_<tag>.txt` — fit equations and R^2 per case |
+| **Out** | `intersection_plots_<tag>/` — one plot per case |
+
+For each case it fits thrust(J) and total_resistance(J), finds the
+self-propulsion point where they intersect, and writes that operating point as
+the objective values.
+
+| Setting | Default | Notes |
+|---|---|---|
+| `N_DESIGN_VARS` | 11 | must match the design vector |
+| `SAVE_TRAINING_DATA` | `True` | set `False` for a dry run |
+
+**Connects to:** `gp_infill_from_training_data.py`, which reads
+`training_data_<tag>.dat`.
+
+---
+
 ## 6. Surrogate / infill
 
-### `gp_infill_from_training_data.py` (or `..._pso.py`)
+### `gp_infill_from_training_data.py` — DRIVER, phase 2
 
 | | |
 |---|---|
@@ -325,3 +389,52 @@ Geometry ≈ 90 s per design, dominated by `build_drdc_grids`. Raise `delta_c`
 to trade surface resolution for speed.
 
 ---
+
+---
+
+## 10. File index — what each script is for
+
+**Drivers (you run these):**
+
+| File | Role |
+|---|---|
+| `Initial_sampling.py` | phase 1: LHS designs + CAD |
+| `generate_def.py` | build CFX `.def` per case |
+| `Run_CFD.py` | submit/solve CFX |
+| `Check_def.py` | validate `.def` files |
+| `get_results.py` | `.res` → `Results_<tag>.txt` |
+| `prop_training.py` | results → `training_data_<tag>.dat` |
+| `gp_infill_from_training_data.py` | phase 2: GP + next designs |
+| `gp_infill_from_training_data_pso.py` | same, PSO acquisition |
+| `Gp_classifier.py` | feasibility classifier (optional) |
+| `job_submission.py` | cluster job submission helper |
+| `Main_PSO.py` | standalone PSO driver |
+
+**Libraries (imported, never run directly):**
+
+| File | Provides |
+|---|---|
+| `x_blade_new.py` | `X_blade()` — design vector → blade surface |
+| `blade_surface_new.py` | the blade surface object |
+| `tip_surfaces_new.py` | `build_drdc_grids()` — 5 blade patches |
+| `blade_cuts_new.py`, `tip_smoothing_new.py` | used by `tip_surfaces_new` |
+| `hub_new.py` | `hub_grids()` — hub sector + caps |
+| `X_CAD_new.py` | `X_CAD_from_design()` → IGES |
+| `cad_worker.py` | CLI subprocess wrapper for CAD |
+| `para.py`, `para_control_bez_updated.py` | section + Bezier design control |
+| `coupled_constraint_config.py` | design constraint limits |
+| `rot_axis.py`, `skew_symmetric_matrix.py` | rotation helpers |
+| `pipeline_config.py` | **all file paths and tags** |
+| `pipeline_io.py` | table read/write helpers |
+| `ESPSOLS.py`, `PSO_function.py` | acquisition optimizers |
+| `bound_check.py`, `penalty.py`, `repair.py` | constraint handling |
+
+**Data files:**
+
+| File | Role |
+|---|---|
+| `airfoil_data_fixed.csv` | airfoil section table (required input) |
+| `create_def.pre` | CFX-Pre session template (required input) |
+
+Start with `pipeline_config.py` — it defines every path and the round tag the
+other scripts key off.
