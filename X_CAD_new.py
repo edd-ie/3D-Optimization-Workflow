@@ -49,6 +49,16 @@ from OCC.Core.BRepBuilderAPI import (BRepBuilderAPI_MakeFace,
                                      BRepBuilderAPI_Sewing)
 from OCC.Core.ShapeFix import ShapeFix_Shape
 from OCC.Extend.DataExchange import write_iges_file
+# for the root trim experiment
+from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeCylinder
+from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Cut
+from OCC.Core.gp import gp_Ax2, gp_Dir
+from OCC.Core.BRep import BRep_Builder
+from OCC.Core.TopoDS import TopoDS_Compound
+from OCC.Core.TopExp import TopExp_Explorer
+from OCC.Core.TopAbs import TopAbs_FACE
+from OCC.Core.IGESControl import IGESControl_Writer
+from OCC.Core.Interface import Interface_Static
 
 from pipeline_config import cad_output_paths
 
@@ -185,8 +195,57 @@ def _apply_orientation(grid, name):
     return np.ascontiguousarray(g)
 
 
+def _count_faces(shape):
+    n, ex = 0, TopExp_Explorer(shape, TopAbs_FACE)
+    while ex.More():
+        n += 1
+        ex.Next()
+    return n
+
+
+def _trim_blade_at_hub(blade_shape, hub_radius_m, ring_x_mm):
+    """Cut away the blade portion INSIDE the hub cylinder.
+
+    The tool is an analytic cylinder SOLID at the design hub radius along +x
+    (tool only; it is never exported). BRepAlgoAPI_Cut(blade, cyl) keeps the
+    part of the blade outside the cylinder, so the root-extended band below
+    the hub surface is removed and the new root edge is OCC's intersection
+    curve of blade and hub cylinder. Units: mm (the faces are built in mm).
+    """
+    R = hub_radius_m * MM_PER_M
+    x_lo = float(ring_x_mm[0]) - 200.0
+    x_hi = float(ring_x_mm[1]) + 200.0
+    ax = gp_Ax2(gp_Pnt(x_lo, 0.0, 0.0), gp_Dir(1.0, 0.0, 0.0))
+    tool = BRepPrimAPI_MakeCylinder(ax, R, x_hi - x_lo).Solid()
+    cut = BRepAlgoAPI_Cut(blade_shape, tool)
+    cut.Build()
+    if not cut.IsDone():
+        raise RuntimeError("root trim failed: BRepAlgoAPI_Cut did not build")
+    out = cut.Shape()
+    n = _count_faces(out)
+    if n < 5:
+        raise RuntimeError(f"root trim produced only {n} faces; refusing")
+    return out
+
+
+def _write_iges_brep(shape, path):
+    """IGES writer in BRep mode (1).
+
+    REQUIRED whenever faces carry trim loops: the default Faces-mode writer
+    exports only each face's underlying surface and DISCARDS trimming (the
+    documented unbounded-cylinder failure earlier in this project). BRep
+    mode writes trimmed faces as MSBO entities, which carry the loops.
+    """
+    Interface_Static.SetCVal("write.iges.unit", "MM")
+    w = IGESControl_Writer("MM", 1)
+    w.AddShape(shape)
+    w.ComputeModel()
+    if not w.Write(str(path)):
+        raise RuntimeError(f"IGES write failed: {path}")
+
+
 def X_CAD(grids, x1, output_dir=None, hub=True, hub_height=None,
-          hub_center=0.0, n_blades=5):
+          hub_center=0.0, n_blades=5, trim_root_at_hub=True):
     """Build the five-surface DRDC blade (plus hub) and write it to IGES.
 
     grids      : dict from tip_surfaces_new.build_drdc_grids()
@@ -250,6 +309,53 @@ def X_CAD(grids, x1, output_dir=None, hub=True, hub_height=None,
     paths = cad_output_paths(x1, output_dir)
     paths["dir"].mkdir(parents=True, exist_ok=True)
     iges_path = paths["iges"]
+
+    if trim_root_at_hub:
+        hub_radius = grids.get("meta", {}).get("hub_radius")
+        if hub_radius is None:
+            raise RuntimeError("trim_root_at_hub needs meta['hub_radius'] "
+                               "(regenerate grids with the current "
+                               "tip_surfaces_new)")
+        # blade faces only: separate the blade shell from the already-added
+        # hub faces by rebuilding the blade shell alone
+        blade_sew = BRepBuilderAPI_Sewing(SEW_TOL)
+        for label, f in faces:
+            if label.startswith("Blade"):
+                blade_sew.Add(f)
+        blade_sew.Perform()
+        blade_fix = ShapeFix_Shape(blade_sew.SewedShape())
+        blade_fix.Perform()
+        blade_shape = blade_fix.Shape()
+
+        ring = np.vstack([np.asarray(grids[k], dtype=float)[0, :, :]
+                          for k in ("te_strip", "central_pressure",
+                                    "le_strip", "central_suction")])
+        ring_x_mm = (ring[:, 0].min() * MM_PER_M,
+                     ring[:, 0].max() * MM_PER_M)
+        blade_trimmed = _trim_blade_at_hub(blade_shape, hub_radius, ring_x_mm)
+
+        comp = TopoDS_Compound()
+        bb = BRep_Builder()
+        bb.MakeCompound(comp)
+        bb.Add(comp, blade_trimmed)
+        if hub:
+            hub_sew = BRepBuilderAPI_Sewing(SEW_TOL)
+            for label, f in faces:
+                if label.startswith("Hub"):
+                    hub_sew.Add(f)
+            hub_sew.Perform()
+            bb.Add(comp, hub_sew.SewedShape())
+        shape = comp
+
+        _write_iges_brep(shape, iges_path)
+        print(f"[X_CAD] blade root TRIMMED at the hub cylinder "
+              f"(R = {hub_radius:.6f} m); trimmed blade faces: "
+              f"{_count_faces(blade_trimmed)}. Written in IGES BRep mode "
+              f"(trim loops preserved).")
+        print(f"IGES file written (trimmed blade"
+              + (" + hub sector + 2 caps" if hub else "") + f"): {iges_path}")
+        return shape
+
     write_iges_file(shape, str(iges_path))
     n_srf = len(faces)
     print(f"IGES file written ({n_srf} faces: 5 blade (root-extended)"
@@ -260,7 +366,7 @@ def X_CAD(grids, x1, output_dir=None, hub=True, hub_height=None,
 def X_CAD_from_design(pitch_con, chord_con, x1, output_dir=None,
                       tip_config=None, write_dat=False, verbose=True,
                       hub=True, hub_height=None, hub_center=0.0,
-                      n_blades=5):
+                      n_blades=5, trim_root_at_hub=True):
     """Convenience wrapper: design vector -> DRDC grids -> IGES.
 
     Drop-in for workers that previously called
@@ -282,4 +388,4 @@ def X_CAD_from_design(pitch_con, chord_con, x1, output_dir=None,
                              verbose=verbose)
     return X_CAD(grids, x1, output_dir=output_dir, hub=hub,
                  hub_height=hub_height, hub_center=hub_center,
-                 n_blades=n_blades)
+                 n_blades=n_blades, trim_root_at_hub=trim_root_at_hub)
