@@ -316,6 +316,22 @@ def X_CAD(grids, x1, output_dir=None, hub=True, hub_height=None,
             raise RuntimeError("trim_root_at_hub needs meta['hub_radius'] "
                                "(regenerate grids with the current "
                                "tip_surfaces_new)")
+        # The blade must actually overhang the hub, or the cut is
+        # degenerate: see the ROOT HANDLING note in this function's
+        # docstring. Measured, not assumed, so an inconsistent
+        # ROOT_EXTENSION cannot slip through.
+        ring_r = np.hypot(
+            *np.vstack([np.asarray(grids[k], dtype=float)[0, :, :]
+                        for k in ("te_strip", "central_pressure",
+                                  "le_strip", "central_suction")])[:, 1:].T)
+        overhang = float(hub_radius - ring_r.max())
+        if overhang <= 1.0e-6:
+            raise RuntimeError(
+                f"trim_root_at_hub=True but the blade root ring sits "
+                f"{overhang * 1000.0:.4f} mm inside the hub radius: there "
+                f"is nothing to trim and the cut would run against the "
+                f"blade's own root edge. Set ROOT_EXTENSION > 0 in "
+                f"blade_surface_new, or trim_root_at_hub=False.")
         # blade faces only: separate the blade shell from the already-added
         # hub faces by rebuilding the blade shell alone
         blade_sew = BRepBuilderAPI_Sewing(SEW_TOL)

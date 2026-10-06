@@ -33,7 +33,7 @@ INPUT_MODE = "test"
 
 # In "infill"/"test" mode, case ids start at CASE_ID_START so geometry does not
 # overwrite earlier cases (e.g. test: 1001, 1002, ...).
-CASE_ID_START = 1001
+CASE_ID_START = 2001
 
 EXISTING_CONTROL_POINTS_PATH = PATHS["existing_input"]
 GENERATED_CONTROL_POINTS_PATH = PATHS["generated"]

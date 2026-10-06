@@ -25,6 +25,15 @@ Outer boundary, Sec. 10 steps 1-6:
   3.  Hermite spline p_h(xi) through the four points, slope 0 at the hub
       ends and m at the LE/TE points: the centre curve, meeting the hub
       ends orthogonally.
+      DEVIATION (center_on_footprint=True, the default): the LE and TE are
+      the ends of the section's camber line, so a curve through them runs
+      as a near-straight chord while the foil body bulges to one side of
+      it, leaving the sector's two side edges at unequal distances from
+      the root section's two surfaces. p_h is therefore laid instead on
+      the MID-LINE of the root footprint, (theta_max + theta_min)/2 at
+      each axial station, which is exactly the equal-gap condition. The
+      Eq. 51-52 extrapolation and the zero-slope hub-end conditions are
+      unchanged; center_on_footprint=False restores the four-point form.
   4-6. Edges: p_h1 = p_h + pi/Z, p_h3 = p_h - pi/Z reversed, joined by the
       straight caps p_h2, p_h4 at xi_hi and xi_lo.
 
@@ -53,7 +62,8 @@ Numpy/scipy only; unit-testable without pythonOCC.
 """
 
 import numpy as np
-from scipy.interpolate import CubicHermiteSpline
+from scipy.interpolate import (CubicHermiteSpline, CubicSpline,
+                               LSQUnivariateSpline)
 
 RING_ROWS = ("te_strip", "central_pressure", "le_strip", "central_suction")
 CYL_SPREAD_TOL = 1.0e-9      # m; the root ring must be this cylindrical
@@ -69,9 +79,59 @@ DEFAULT_N_BLADES = 5
 # the enclosure guard below still rejects any outlier loudly.)
 DEFAULT_HUB_HEIGHT = 1.0    # m
 DEFAULT_HUB_CENTER = 0.0     # m (x of the hub midpoint); None = per-design
-DEFAULT_N_S = 121            # samples across the sector
-DEFAULT_N_X = 61             # samples along the axis (p_h(x) is curved)
+# Sector sampling. The budget is deliberately shifted from s to x.
+#   s: the sector is a 72 deg circular arc at constant radius, which a
+#      cubic reproduces almost exactly -- at 41 points (1.8 deg) the
+#      interpolation error is ~1e-6 mm, so 121 was spending points on a
+#      direction that does not need them.
+#   x: this is the direction that has to follow the centred p_h. Measured
+#      with 61 columns (~8 mm across the footprint) the exported edge lay
+#      1.01 mm off p_h even though p_h itself was within 0.018 mm of the
+#      mid-line: the whole remaining error was axial resolution. Cubic
+#      error falls as h^4, so 321 columns (~3.1 mm) should leave ~0.02 mm.
+# Net grid 41 x 321 vs the old 121 x 61: 1.8x the points, not 5x.
+DEFAULT_N_S = 41             # samples across the sector
+DEFAULT_N_X = 321            # samples along the axis (p_h(x) is curved)
 FOOT_MARGIN_DEG = 1.0        # required clearance footprint <-> sector edge
+# Centre-curve fitting. The tuning history, because the answer is not the
+# obvious one:
+#   41 uniform nodes, interpolating     -> 1.26 mm off-centre
+#   61 cosine-clustered, interpolating  -> 0.018 mm, but the strip edge's
+#                                          curvature rose 140x, from 857 to
+#                                          119926 deg/m^2 (a ~4 mm radius
+#                                          turn on a 119 mm hub)
+# That spike was an artifact of node PLACEMENT, not of the geometry: with
+# an inset of 1e-6 of the span, the clustered end nodes sat microns from
+# the footprint's axial extremes, where the section turns around,
+# consecutive footprint samples differ in x by microns, and the envelope's
+# crossing interpolation is ill-conditioned. Those nodes were interpolating
+# numerical noise. Hence two controls:
+#   CENTRE_INSET        keeps nodes clear of that degenerate zone;
+#   CENTRE_SMOOTH_KNOTS fits the mid-line by least squares through a small
+#                       number of knots instead of interpolating it, so p_h
+#                       is smooth by construction and cannot chase noise.
+# None restores interpolation (sharper, and only sensible with a healthy
+# inset). Equal gaps are worth little if they cost the mesher a curvature
+# spike, so the default errs toward smooth.
+#
+# Measured sweep at inset 1%, one design, Z = 5 (max asymmetry as arc on
+# the hub / max strip-edge curvature):
+#       doc Eqs. 51-53    23.652 mm      857 deg/m^2   1.0x
+#       interpolating      1.097 mm    12484           14.6x
+#       24 knots           1.348 mm     7145            8.3x
+#       16 knots           2.075 mm    10825           12.6x
+#       10 knots           1.615 mm     5929            6.9x
+#        6 knots           0.672 mm     3924            4.6x   <- default
+# The sweep is NOT monotonic in knot count, which is the whole point: a
+# stiffer fit comes out both smoother AND better centred, so the extra
+# freedom was being spent on noise, not on geometry. 6 knots is the best
+# point on both axes at once. Note also that essentially all of the
+# residual sits at the two axial extremes, where the edge gaps are ~35 deg
+# and 0.7 mm is under 1% of them; at the TIGHTEST station, which is what a
+# viewer sees, the two gaps agree to about 0.01 deg.
+CENTRE_NODES = 61
+CENTRE_SMOOTH_KNOTS = 6
+CENTRE_INSET = 0.01          # fraction of footprint span left at each end
 
 
 def root_ring_from_grids(grids):
@@ -108,8 +168,120 @@ def _edge_root_point(grids, key, theta_ref):
     return float(p[0]), th
 
 
+def _theta_envelope(x_fp, th_fp, x_query):
+    """Extreme theta of the closed footprint polyline at each x station.
+
+    Exact for a polyline: every segment that straddles the station
+    contributes its linearly interpolated theta, and the min / max over
+    those crossings are the two surfaces the strip edges must clear. Using
+    crossings rather than a monotone branch split means a section that
+    doubles back in x (heavy skew) needs no special case.
+
+    Stations with no crossing come back NaN.
+    """
+    x0, x1 = x_fp, np.roll(x_fp, -1)
+    t0, t1 = th_fp, np.roll(th_fp, -1)
+    dx = x1 - x0
+    lo = np.full(len(x_query), np.nan)
+    hi = np.full(len(x_query), np.nan)
+    for k, xq in enumerate(x_query):
+        hit = ((x0 - xq) * (x1 - xq) <= 0.0) & (dx != 0.0)
+        if not np.any(hit):
+            continue
+        th = t0[hit] + (xq - x0[hit]) / dx[hit] * (t1[hit] - t0[hit])
+        lo[k], hi[k] = th.min(), th.max()
+    return lo, hi
+
+
+def _footprint_theta(fp, th_ref):
+    """Footprint points -> (x, theta) with theta measured from th_ref."""
+    fp = np.asarray(fp, dtype=float)
+    th = np.arctan2(fp[:, 1], fp[:, 2]) - th_ref
+    return fp[:, 0], np.arctan2(np.sin(th), np.cos(th))
+
+
+def _centred_centre_curve(fp, th_ref, xi_lo, xi_hi, n_nodes=CENTRE_NODES,
+                          smooth_knots=CENTRE_SMOOTH_KNOTS,
+                          inset=CENTRE_INSET):
+    """Centre curve p_h(x) laid on the MID-LINE of the blade footprint.
+
+    TM 2013-178 Eqs. 51-53 run p_h through the root LE and TE points. Those
+    two points are the ends of the section's camber line, so between them
+    p_h is a near-straight chord while the foil body bulges to one side of
+    it; the strip edges p_h +- pi/Z then sit closer to one surface of the
+    root section than to the other. Here p_h is instead the mid-line of the
+    footprint,
+
+        p_h(x) = (theta_max(x) + theta_min(x)) / 2,
+
+    which is precisely the condition that equalises the two edge clearances
+    at every axial station (the edges are offset from p_h by the same
+    +-pi/Z, so equal gaps <=> p_h halfway between the two surfaces).
+
+    The doc's END conditions are kept unchanged: beyond the footprint the
+    curve extrapolates with half the mid-line's chord slope (Eqs. 51-52)
+    and reaches both hub ends with zero slope, so the sector still meets
+    the end caps orthogonally and Z rotated copies still tile.
+
+    Returns (p_h, x_nodes, mid, m).
+    """
+    x_fp, th_fp = _footprint_theta(fp, th_ref)
+    xa, xb = float(x_fp.min()), float(x_fp.max())
+    span = xb - xa
+    if not (span > 0.0):
+        raise RuntimeError("hub centring: root footprint has no axial extent")
+    # Stay out of the degenerate zone at the two axial extremes (see the
+    # CENTRE_INSET note above).
+    a = xa + float(inset) * span
+    b = xb - float(inset) * span
+
+    if smooth_knots:
+        # Least-squares fit through a few uniform knots: smooth by
+        # construction, so p_h cannot follow either the mid-line's hardest
+        # turns or the envelope's noise near the ends.
+        xs_d = np.linspace(a, b, 401)
+        lo_d, hi_d = _theta_envelope(x_fp, th_fp, xs_d)
+        good = np.isfinite(lo_d)
+        if good.sum() < 20:
+            raise RuntimeError("hub centring: too few usable stations on the "
+                               "root footprint")
+        xs_d, mid_d = xs_d[good], 0.5 * (lo_d[good] + hi_d[good])
+        n_int = max(1, int(smooth_knots))
+        t_int = np.linspace(xs_d[0], xs_d[-1], n_int + 2)[1:-1]
+        fit = LSQUnivariateSpline(xs_d, mid_d, t_int, k=3)
+        x_nodes = np.linspace(a, b, int(n_nodes))
+        mid = fit(x_nodes)
+    else:
+        # Interpolate the mid-line, cosine-clustered toward both ends.
+        u = 0.5 * (1.0 - np.cos(np.linspace(0.0, np.pi, int(n_nodes))))
+        x_nodes = a + (b - a) * u
+        lo, hi = _theta_envelope(x_fp, th_fp, x_nodes)
+        if not np.all(np.isfinite(lo)):
+            raise RuntimeError("hub centring: root footprint has no crossing "
+                               "at some axial station; check the root "
+                               "section")
+        mid = 0.5 * (lo + hi)
+
+    m = (mid[-1] - mid[0]) / (x_nodes[-1] - x_nodes[0])             # Eq. 53
+    th_lo = mid[0] - 0.5 * m * (x_nodes[0] - xi_lo)                 # Eq. 51
+    th_hi = mid[-1] + 0.5 * m * (xi_hi - x_nodes[-1])               # Eq. 52
+
+    xs = np.concatenate([[xi_lo], x_nodes, [xi_hi]])
+    ts = np.concatenate([[th_lo], mid, [th_hi]])
+    if np.any(np.diff(xs) <= 0):
+        raise RuntimeError("hub centring: centre-curve nodes are not strictly "
+                           "increasing in x; the hub is too short for this "
+                           "root section")
+    # C2 spline with zero end slope: the doc's orthogonal meeting at the
+    # hub ends, but following the mid-line in between.
+    p_h = CubicSpline(xs, ts, bc_type=((1, 0.0), (1, 0.0)))
+    return p_h, x_nodes, mid, float(m)
+
+
 def hub_grids(grids, hub_height=None, hub_center=DEFAULT_HUB_CENTER,
-              hub_radius=None,
+              hub_radius=None, center_on_footprint=True,
+              centre_nodes=CENTRE_NODES,
+              centre_smooth=CENTRE_SMOOTH_KNOTS,
               n_blades=DEFAULT_N_BLADES,
               n_s=DEFAULT_N_S, n_x=DEFAULT_N_X, n_rho=25,
               cap_inner_radius=0.0, verbose=True):
@@ -119,6 +291,15 @@ def hub_grids(grids, hub_height=None, hub_center=DEFAULT_HUB_CENTER,
                  None = DEFAULT_HUB_HEIGHT (fixed, batch-consistent).
     hub_center : x of the hub midpoint; None = this design's ring midpoint
                  (per-design). Default DEFAULT_HUB_CENTER = 0.0, fixed.
+    center_on_footprint : place the centre curve on the mid-line of the
+                 blade root footprint so the sector's two side edges are
+                 equidistant from the root section's two surfaces at every
+                 axial station. Needs meta['root_footprint']; falls back to
+                 the doc's LE/TE construction when it is absent. False
+                 restores TM 2013-178 Eqs. 51-53 verbatim.
+    centre_nodes : mid-line samples used to build the centred curve.
+    centre_smooth : least-squares knots for the mid-line fit (None to
+                 interpolate instead); see the CENTRE_SMOOTH_KNOTS note.
     n_blades   : Z; the sector spans exactly 2 pi / Z.
     n_rho      : radial samples on each end cap.
     cap_inner_radius : caps run from the hub radius down to this radius.
@@ -168,22 +349,30 @@ def hub_grids(grids, hub_height=None, hub_center=DEFAULT_HUB_CENTER,
     # --- Sec. 10 steps 1-3: the centre curve p_h(xi) ----------------------
     xi_le, th_le = _edge_root_point(grids, "le_strip", th_ref)
     xi_te, th_te = _edge_root_point(grids, "te_strip", th_ref)
-    if abs(xi_te - xi_le) < 1e-9:
-        m = 0.0
+    fp = grids.get("meta", {}).get("root_footprint")
+    centred = bool(center_on_footprint) and fp is not None
+    if centred:
+        # p_h on the footprint mid-line: equal edge gaps at every station
+        p_h, x_nodes, mid, m = _centred_centre_curve(
+            fp, th_ref, xi_lo, xi_hi, centre_nodes, centre_smooth)
     else:
-        m = (th_te - th_le) / (xi_te - xi_le)                       # Eq. 53
-    th_lo = th_le - 0.5 * m * (xi_le - xi_lo)                       # Eq. 51
-    th_hi = th_te + 0.5 * m * (xi_hi - xi_te)                       # Eq. 52
+        # TM 2013-178 Eqs. 51-53 verbatim: p_h through the root LE/TE
+        if abs(xi_te - xi_le) < 1e-9:
+            m = 0.0
+        else:
+            m = (th_te - th_le) / (xi_te - xi_le)                   # Eq. 53
+        th_lo = th_le - 0.5 * m * (xi_le - xi_lo)                   # Eq. 51
+        th_hi = th_te + 0.5 * m * (xi_hi - xi_te)                   # Eq. 52
 
-    nodes = sorted([(xi_lo, th_lo, 0.0), (xi_le, th_le, m),
-                    (xi_te, th_te, m), (xi_hi, th_hi, 0.0)])
-    xs = np.array([n[0] for n in nodes])
-    ts = np.array([n[1] for n in nodes])
-    ds = np.array([n[2] for n in nodes])
-    if np.any(np.diff(xs) <= 0):
-        raise RuntimeError("hub centre-curve nodes are not strictly "
-                           "increasing in x; check the root LE/TE points")
-    p_h = CubicHermiteSpline(xs, ts, ds)
+        nodes = sorted([(xi_lo, th_lo, 0.0), (xi_le, th_le, m),
+                        (xi_te, th_te, m), (xi_hi, th_hi, 0.0)])
+        xs = np.array([n[0] for n in nodes])
+        ts = np.array([n[1] for n in nodes])
+        ds = np.array([n[2] for n in nodes])
+        if np.any(np.diff(xs) <= 0):
+            raise RuntimeError("hub centre-curve nodes are not strictly "
+                               "increasing in x; check the root LE/TE points")
+        p_h = CubicHermiteSpline(xs, ts, ds)
 
     half = np.pi / Z
 
@@ -206,6 +395,32 @@ def hub_grids(grids, hub_height=None, hub_center=DEFAULT_HUB_CENTER,
             f"{clearance_deg:.2f} deg (need {FOOT_MARGIN_DEG:.1f}); with "
             f"Z = {Z} the blades would overlap at the root")
 
+    # --- centring diagnostic ----------------------------------------------
+    # The two strip edges sit at p_h +- half. At each axial station the gap
+    # to the blade is (p_h + half) - theta_max above and theta_min -
+    # (p_h - half) below; centring is exactly the statement that these are
+    # equal. Reported as an arc length on the hub surface, which is what is
+    # visible in CAD.
+    if fp is not None:
+        x_fp, th_fp = _footprint_theta(fp, th_ref)
+        xq = np.linspace(float(x_fp.min()), float(x_fp.max()), 401)[1:-1]
+        lo_e, hi_e = _theta_envelope(x_fp, th_fp, xq)
+        ok = np.isfinite(lo_e)
+        ph_q = p_h(xq[ok])
+        d_up = (ph_q + half) - hi_e[ok]
+        d_dn = lo_e[ok] - (ph_q - half)
+        asym = np.abs(d_up - d_dn)
+        offcentre_deg = float(np.degrees(asym.max()))
+        offcentre_mm = float(asym.max() * R * 1000.0)
+        min_gap_deg = float(np.degrees(min(d_up.min(), d_dn.min())))
+        if min_gap_deg <= 0.0:
+            raise RuntimeError(
+                f"hub strip edge cuts into the blade root footprint "
+                f"(gap {min_gap_deg:.3f} deg); with Z = {Z} the sector is "
+                f"too narrow for this root section")
+    else:
+        offcentre_deg = offcentre_mm = min_gap_deg = float("nan")
+
     # --- Sec. 10 steps 4-6 as one rectangular grid ------------------------
     # theta(s, xi) = p_h(xi) + (2s - 1) * pi/Z. Grid edges:
     #   s = 1        -> p_h + pi/Z  = c_h1
@@ -213,6 +428,14 @@ def hub_grids(grids, hub_height=None, hub_center=DEFAULT_HUB_CENTER,
     #   xi = xi_hi   -> straight cap = c_h2
     #   xi = xi_lo   -> straight cap = c_h4
     s = np.linspace(0.0, 1.0, int(n_s))
+    # Axial columns stay UNIFORM, deliberately. The centred p_h curves most
+    # near the two ends of the footprint, so concentrating columns there is
+    # the obvious way to resolve it -- but X_CAD splines the hub with
+    # grid_to_bspline_surface(hgrids[key]), i.e. with the interpolator's
+    # own UNIFORM parameterization and no v_params, and unequal spacing
+    # under a uniform parameterization is precisely what overshoots into
+    # lobes on the wrap patches (see that function's docstring). Resolution
+    # is bought with a larger n_x instead, paid for by a smaller n_s.
     x = np.linspace(xi_lo, xi_hi, int(n_x))
     TH = th_ref + p_h(x)[None, :] + (2.0 * s - 1.0)[:, None] * half
     G = np.empty((len(s), len(x), 3))
@@ -262,7 +485,9 @@ def hub_grids(grids, hub_height=None, hub_center=DEFAULT_HUB_CENTER,
                 slope_m=float(m), clearance_deg=clearance_deg,
                 tile_err=tile_err, ring_on_surface=ring_err,
                 cap_seam=cap_seam, cap_inner_radius=r_in,
-                xi_le=xi_le, th_le=th_le, xi_te=xi_te, th_te=th_te)
+                xi_le=xi_le, th_le=th_le, xi_te=xi_te, th_te=th_te,
+                centred=centred, offcentre_deg=offcentre_deg,
+                offcentre_mm=offcentre_mm, min_edge_gap_deg=min_gap_deg)
 
     log(f"[hub] Sec. 10 sector: Z = {Z}, width {np.degrees(2*half):.2f} deg, "
         f"radius {R:.6f} m"
@@ -271,9 +496,18 @@ def hub_grids(grids, hub_height=None, hub_center=DEFAULT_HUB_CENTER,
            if info['ring_immersion'] > 1e-9 else " (measured from ring)"))
     log(f"[hub] height {H:.4f} m, axial [{xi_lo:.4f}, {xi_hi:.4f}] m "
         f"(root ring spans [{info['x_lo']:.4f}, {info['x_hi']:.4f}])")
-    log(f"[hub] centre curve: LE ({xi_le:.4f}, {np.degrees(th_le):.2f} deg) "
-        f"TE ({xi_te:.4f}, {np.degrees(th_te):.2f} deg), "
-        f"slope m {m:.4f} rad/m (Eqs. 51-53)")
+    if centred:
+        log(f"[hub] centre curve CENTRED on the root-footprint mid-line "
+            f"({len(x_nodes)} nodes), slope m {m:.4f} rad/m; hub ends still "
+            f"met orthogonally (Eqs. 51-52 extrapolation)")
+    else:
+        log(f"[hub] centre curve: LE ({xi_le:.4f}, {np.degrees(th_le):.2f} "
+            f"deg) TE ({xi_te:.4f}, {np.degrees(th_te):.2f} deg), "
+            f"slope m {m:.4f} rad/m (Eqs. 51-53, NOT centred)")
+    if np.isfinite(offcentre_deg):
+        log(f"[hub] edge-gap asymmetry {offcentre_deg:.4f} deg "
+            f"({offcentre_mm:.3f} mm of arc); smallest edge gap "
+            f"{min_gap_deg:.2f} deg")
     log(f"[hub] footprint clearance {clearance_deg:.2f} deg; "
         f"tiling error over Z copies {tile_err:.2e} m; "
         f"root ring on surface to {ring_err:.2e} m")

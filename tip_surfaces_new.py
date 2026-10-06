@@ -918,11 +918,28 @@ def build_drdc_grids(blade, cfg=None, verbose=True, row_cache=None):
 
     # design hub radius (m): the hub is sized from the DESIGN root, never
     # from the (root-extended) ring the patches actually reach
-    hub_radius = getattr(blade, "r_root_design",
-                         getattr(blade, "r_root", None))
-    hub_radius = None if hub_radius is None else hub_radius * blade.d / 2.0
+    r_root_norm = getattr(blade, "r_root_design",
+                          getattr(blade, "r_root", None))
+    hub_radius = (None if r_root_norm is None
+                  else r_root_norm * blade.d / 2.0)
+
+    # Dense root section AT the design hub radius, ordered around the
+    # section (xi 0 -> 1, closing point not repeated). This is the curve
+    # the blade actually cuts in the hub surface, and hub_new centres the
+    # hub sector on its mid-line. It is taken from the ANALYTIC blade, not
+    # from the patch root rows, for two reasons: those rows now sit at the
+    # ROOT-EXTENDED radius (a slightly different section), and the four
+    # patches sample the section at very different densities, which would
+    # bias a mid-line measured from them.
+    if r_root_norm is None:
+        root_footprint = None
+    else:
+        xi_fp = np.linspace(0.0, 1.0, 2001)[:-1]
+        eta_fp = blade.eta_of_r(r_root_norm)
+        root_footprint = blade.b(xi_fp, np.full(xi_fp.shape, eta_fp))
+
     meta = dict(cfg=cfg, N=N, N_t=N_t, L_outline=L, s_tip=s_tip,
-                hub_radius=hub_radius,
+                hub_radius=hub_radius, root_footprint=root_footprint,
                 j_te=j_te, j_le=j_le, t_common=t_common,
                 eta_min=blade.eta_min, r_tip=blade.r_tip,
                 reversals=reversals,
